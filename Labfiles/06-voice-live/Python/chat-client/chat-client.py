@@ -2,10 +2,24 @@ import os
 import asyncio
 import base64
 import queue
+import traceback
 from dotenv import load_dotenv
 import pyaudio
 
 # import namespaces
+from azure.identity.aio import AzureCliCredential
+from azure.ai.voicelive.aio import connect
+from azure.ai.voicelive.models import (
+    InputAudioFormat,
+    Modality,
+    OutputAudioFormat,
+    RequestSession,
+    ServerEventType,
+    AudioNoiseReduction,
+    AudioEchoCancellation,
+    AzureSemanticVadMultilingual,
+    AgentConfig
+) 
 
 
 
@@ -21,6 +35,18 @@ def main():
         endpoint = os.environ.get("AZURE_VOICELIVE_ENDPOINT")
         agent_name = os.environ.get("AZURE_VOICELIVE_AGENT_ID")
         project_name = os.environ.get("AZURE_VOICELIVE_PROJECT_NAME")
+
+        # Fail here with a clear message rather than deep inside connect()
+        missing = [name for name, value in (
+            ("AZURE_VOICELIVE_ENDPOINT", endpoint),
+            ("AZURE_VOICELIVE_AGENT_ID", agent_name),
+            ("AZURE_VOICELIVE_PROJECT_NAME", project_name),
+        ) if not value]
+        if missing:
+            print(f"❌ Missing environment variables: {', '.join(missing)}")
+            print("   Check that .env exists in this folder and sets them.")
+            return
+
         agent_config = AgentConfig({ "agent_name": agent_name, "project_name": project_name })
 
         
@@ -44,6 +70,7 @@ def main():
 
     except Exception as e:
         print(f"❌ An error occurred: {e}")
+        traceback.print_exc()
 
 
 # VoiceAssistant class - main coordinator for the voice agent
@@ -62,34 +89,43 @@ class VoiceAssistant:
         self.endpoint = endpoint
         self.credential = credential
         self.agent_config = agent_config
+
     async def start(self):
         """Start the voice assistant."""
-        print("\n" + "=" * 60)
-        print("🎙️  AZURE VOICELIVE VOICE AGENT")
-        print("=" * 60)
-        
+        print("\n" + "=" *60)
+        print(f"🎙️   {self.agent_config['agent_name']}")
+        print("="* 60)
+
         # Add your code in this try block!
         try:
             # STEP 1: Connect Azure VoiceLive to the agent
-
-                
+            async with connect(
+                endpoint=self.endpoint,
+                credential=self.credential,
+                api_version="2026-01-01-preview",
+                agent_config=self.agent_config
+            ) as connection:
+                self.connection = connection
+                    
                 # STEP 2: Initialize audio processor
-                
-                
+                self.audio_processor = AudioProcessor(connection)
+                                  
                 # STEP 3: Configure the session
-                
+                await self.setup_session()
                 
                 # STEP 4: Start audio systems
-                
+                self.audio_processor.start_playback()
+        
+                print("\n✅ Ready! Start speaking...")
+                print("Press Ctrl+C to exit\n")
                 
                 # STEP 5: Process events
-                
+                await self.process_events()
 
-        
         finally:
             if hasattr(self, 'audio_processor'):
                 self.audio_processor.shutdown()
-    
+                
     async def setup_session(self):
         """Configure the session with audio settings."""
         
@@ -183,6 +219,10 @@ class AudioProcessor:
         self.input_stream = None
         self.output_stream = None
         self.playback_queue = queue.Queue()
+
+        # Audio pulled from the queue but not yet played, and whether a send has failed
+        self.remaining = bytes()
+        self.send_failed = False
     
     def start_capture(self):
         """Start capturing audio from the microphone."""
@@ -190,10 +230,13 @@ class AudioProcessor:
         def capture_callback(in_data, frame_count, time_info, status):
             # Convert audio to base64 and send to VoiceLive
             audio_base64 = base64.b64encode(in_data).decode("utf-8")
-            asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 self.connection.input_audio_buffer.append(audio=audio_base64),
                 self.loop
             )
+            # Without this, a failed send is swallowed by the future and the
+            # mic appears to keep working while nothing reaches the service
+            future.add_done_callback(self.report_send_error)
             return (None, pyaudio.paContinue)
         
         # Store event loop for use in callback thread
@@ -212,15 +255,11 @@ class AudioProcessor:
     def start_playback(self):
         """Start audio playback system."""
         
-        remaining = bytes()
-        
         def playback_callback(in_data, frame_count, time_info, status):
-            nonlocal remaining
-            
             # Calculate bytes needed
             bytes_needed = frame_count * pyaudio.get_sample_size(pyaudio.paInt16)
-            output = remaining[:bytes_needed]
-            remaining = remaining[bytes_needed:]
+            output = self.remaining[:bytes_needed]
+            self.remaining = self.remaining[bytes_needed:]
             
             # Get more audio from queue if needed
             while len(output) < bytes_needed:
@@ -236,7 +275,7 @@ class AudioProcessor:
             
             # Keep any extra for next callback
             if len(output) > bytes_needed:
-                remaining = output[bytes_needed:]
+                self.remaining = output[bytes_needed:]
                 output = output[:bytes_needed]
             
             return (output, pyaudio.paContinue)
@@ -251,12 +290,25 @@ class AudioProcessor:
         )
         print("🔊 Speakers ready")
     
+    def report_send_error(self, future):
+        """Report the first failed audio send (capture runs 20 times a second)."""
+        if self.send_failed:
+            return
+        try:
+            future.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.send_failed = True
+            print(f"❌ Failed to send audio: {e}")
+
     def queue_audio(self, audio_data):
         """Add audio data to the playback queue."""
         self.playback_queue.put(audio_data)
     
     def clear_playback_queue(self):
         """Clear any pending audio (used when user interrupts)."""
+        self.remaining = bytes()
         while not self.playback_queue.empty():
             try:
                 self.playback_queue.get_nowait()

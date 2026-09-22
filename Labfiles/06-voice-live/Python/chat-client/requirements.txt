@@ -1,3 +1,4 @@
-dotenv
-aiohttp
+python-dotenv
+azure-identity
+azure-ai-voicelive[aiohttp]==1.2.0b4
 pyaudio
